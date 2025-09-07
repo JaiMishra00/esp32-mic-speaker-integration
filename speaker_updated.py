@@ -1,175 +1,319 @@
-from flask import Flask, render_template, send_file, request
+#!/usr/bin/env python3
+
 import asyncio
 import websockets
+import json
 import wave
-import threading
 import os
+import time
+from datetime import datetime
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+import threading
+import struct
 
-app = Flask(__name__)
-
-SAMPLE_RATE = 16000
-CHANNELS = 1
-SAMPLE_WIDTH = 2
-
-audio_buffer = bytearray()
-connected_clients = set()
-
-@app.route('/')
-def index():
-    print("[DEBUG] Received GET / request from", request.remote_addr)
-    return render_template('index1.html')
-
-@app.route('/download')
-def download():
-    print("[DEBUG] /download accessed")
-    if not os.path.exists("recording.wav") or os.path.getsize("recording.wav") == 0:
-        return "No recording file found.", 404
-    return send_file("recording.wav", as_attachment=True)
-
-async def ping_loop(websocket):
-    try:
-        while True:
-            await websocket.ping()
-            await asyncio.sleep(20)
-    except:
-        pass
-
-async def send_audio_for_playback(websocket, filename):
-    """Send the recorded audio back to ESP32 for playback with flow control"""
-    try:
-        if not os.path.exists(filename):
-            print("[ERROR] No recording file found for playback")
-            return
+class AudioServer:
+    def __init__(self, websocket_port=8765, http_port=8000):
+        self.websocket_port = websocket_port
+        self.http_port = http_port
+        self.audio_files = {}  # Store audio files with timestamps
+        self.clients = set()
+        
+        # Create audio directory
+        os.makedirs("audio_files", exist_ok=True)
+        
+    async def register_client(self, websocket):
+        """Register a new client"""
+        self.clients.add(websocket)
+        print(f"Client connected. Total clients: {len(self.clients)}")
+        
+    async def unregister_client(self, websocket):
+        """Unregister a client"""
+        self.clients.discard(websocket)
+        print(f"Client disconnected. Total clients: {len(self.clients)}")
+        
+    def save_audio_file(self, audio_data, metadata):
+        """Save audio data as WAV file"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"audio_{timestamp}.wav"
+        filepath = os.path.join("audio_files", filename)
+        
+        sample_rate = metadata.get('sample_rate', 16000)
+        bits_per_sample = metadata.get('bits_per_sample', 16)
+        channels = metadata.get('channels', 1)
+        
+        print(f"Saving audio: {filename}")
+        print(f"Sample rate: {sample_rate}Hz, Bits: {bits_per_sample}, Channels: {channels}")
+        print(f"Data size: {len(audio_data)} bytes")
+        
+        try:
+            with wave.open(filepath, 'wb') as wav_file:
+                wav_file.setnchannels(channels)
+                wav_file.setsampwidth(bits_per_sample // 8)
+                wav_file.setframerate(sample_rate)
+                wav_file.writeframes(audio_data)
+                
+            self.audio_files[filename] = {
+                'filepath': filepath,
+                'timestamp': timestamp,
+                'metadata': metadata,
+                'size': len(audio_data)
+            }
             
-        with open(filename, 'rb') as f:
-            # Skip WAV header (44 bytes) to get raw PCM data
-            f.seek(44)
-            audio_data = f.read()
+            print(f"Audio saved successfully: {filepath}")
+            return filename
             
-        print(f"[DEBUG] Starting playback of {len(audio_data)} bytes")
+        except Exception as e:
+            print(f"Error saving audio file: {e}")
+            return None
+    
+    def load_audio_file(self, filename):
+        """Load audio file and return raw data"""
+        filepath = os.path.join("audio_files", filename)
         
-        # Stream audio in chunks with flow control
-        chunk_size = 512  # Match ESP32 buffer expectations
-        total_chunks = (len(audio_data) + chunk_size - 1) // chunk_size
-        chunks_sent = 0
-        paused = False
-        
-        for i in range(0, len(audio_data), chunk_size):
-            # Wait if streaming is paused
-            while paused:
-                await asyncio.sleep(0.01)
-                
-            chunk = audio_data[i:i+chunk_size]
+        if not os.path.exists(filepath):
+            print(f"Audio file not found: {filepath}")
+            return None
             
-            try:
-                await websocket.send(chunk)
-                chunks_sent += 1
-                
-                # Debug output every 10 chunks
-                if chunks_sent % 10 == 0:
-                    progress = (chunks_sent / total_chunks) * 100
-                    print(f"[DEBUG] Playback progress: {chunks_sent}/{total_chunks} chunks ({progress:.1f}%)")
-                
-                # Small delay to prevent overwhelming the ESP32
-                await asyncio.sleep(0.02)  # 20ms delay between chunks
-                
-            except websockets.exceptions.ConnectionClosed:
-                print("[DEBUG] WebSocket closed during playback")
-                break
-            except Exception as e:
-                print(f"[ERROR] Failed to send chunk {chunks_sent}: {e}")
-                break
-                
-        print(f"[DEBUG] Playback complete - sent {chunks_sent} chunks")
-        
-        # Store flow control state for this connection
-        websocket.flow_control_paused = paused
-        
-    except Exception as e:
-        print(f"[ERROR] Failed to send playback audio: {e}")
-
-async def handle_websocket(websocket):
-    global audio_buffer
-    print(f"[DEBUG] WebSocket connected from {websocket.remote_address}")
+        try:
+            with wave.open(filepath, 'rb') as wav_file:
+                frames = wav_file.readframes(wav_file.getnframes())
+                return frames
+        except Exception as e:
+            print(f"Error loading audio file: {e}")
+            return None
     
-    connected_clients.add(websocket)
-    
-    # Initialize flow control state
-    websocket.flow_control_paused = False
-    websocket.playback_task = None
-    
-    # Start ping loop
-    asyncio.create_task(ping_loop(websocket))
-
-    try:
-        async for message in websocket:
-            if isinstance(message, str):
-                print(f"[DEBUG] Received text message: {message}")
+    async def handle_message(self, websocket, message):
+        """Handle incoming WebSocket messages"""
+        try:
+            # Try to parse as JSON first
+            data = json.loads(message)
+            message_type = data.get('type')
+            
+            if message_type == 'start_recording':
+                # Initialize streaming recording
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"audio_{timestamp}.wav"
+                filepath = os.path.join("audio_files", filename)
                 
-                if message == "STOP_RECORD":
-                    if audio_buffer:
-                        try:
-                            with wave.open("recording.wav", 'wb') as wf:
-                                wf.setnchannels(CHANNELS)
-                                wf.setsampwidth(SAMPLE_WIDTH)
-                                wf.setframerate(SAMPLE_RATE)
-                                wf.writeframes(audio_buffer)
-                            print(f"[DEBUG] Saved recording.wav ({len(audio_buffer)} bytes)")
-                            print("\n==== AUDIO FILE READY ====")
-                            print(f"Download link: http://localhost:5000/download\n")
-                        except Exception as e:
-                            print(f"[ERROR] Failed to save WAV file: {e}")
-                    else:
-                        print("[DEBUG] No audio data was received before stopping.")
+                # Store recording info
+                self.active_recordings[websocket] = {
+                    'filename': filename,
+                    'filepath': filepath,
+                    'metadata': data,
+                    'audio_data': bytearray(),
+                    'start_time': time.time()
+                }
+                
+                print(f"Started streaming recording: {filename}")
+                print(f"Sample rate: {data.get('sample_rate')}Hz")
+                
+            elif message_type == 'end_recording':
+                # Finish recording and save file
+                if websocket in self.active_recordings:
+                    recording = self.active_recordings[websocket]
                     
-                    # Reset buffer for next recording
-                    audio_buffer = bytearray()
+                    # Save the accumulated audio data
+                    self.save_streaming_audio(recording)
                     
-                elif message == "REQUEST_PLAYBACK":
-                    print("[DEBUG] Playback requested, starting streaming...")
-                    # Cancel any existing playback task
-                    if websocket.playback_task and not websocket.playback_task.done():
-                        websocket.playback_task.cancel()
+                    # Store in audio files registry
+                    self.audio_files[recording['filename']] = {
+                        'filepath': recording['filepath'],
+                        'timestamp': recording['filename'].split('_')[1:],
+                        'metadata': recording['metadata'],
+                        'size': len(recording['audio_data']),
+                        'duration': data.get('duration', 0)
+                    }
                     
-                    # Start new playback task
-                    websocket.playback_task = asyncio.create_task(
-                        send_audio_for_playback(websocket, "recording.wav")
-                    )
+                    websocket.last_audio_file = recording['filename']
                     
-                elif message == "PAUSE_STREAM":
-                    print("[DEBUG] Stream pause requested by ESP32")
-                    websocket.flow_control_paused = True
+                    # Create download link
+                    download_link = f"http://localhost:{self.http_port}/audio_files/{recording['filename']}"
                     
-                elif message == "RESUME_STREAM":
-                    print("[DEBUG] Stream resume requested by ESP32")
-                    websocket.flow_control_paused = False
+                    # Send completion message
+                    response = {
+                        "type": "recording_complete",
+                        "filename": recording['filename'],
+                        "size": len(recording['audio_data']),
+                        "duration": data.get('duration', 0)
+                    }
+                    await websocket.send(json.dumps(response))
                     
+                    # Send download link
+                    link_response = {
+                        "type": "download_link",
+                        "link": download_link
+                    }
+                    await websocket.send(json.dumps(link_response))
+                    
+                    print(f"Recording completed: {recording['filename']}")
+                    print(f"Duration: {data.get('duration', 0):.2f}s, Size: {len(recording['audio_data'])} bytes")
+                    print(f"Download: {download_link}")
+                    
+                    # Clean up
+                    del self.active_recordings[websocket]
+                    
+            elif message_type == 'download_audio':
+                # Send the most recent audio file back (chunked for large files)
+                if hasattr(websocket, 'last_audio_file') and websocket.last_audio_file:
+                    await self.send_audio_chunked(websocket, websocket.last_audio_file)
+                else:
+                    await websocket.send(json.dumps({
+                        "type": "error", 
+                        "message": "No audio file available"
+                    }))
+                    
+        except json.JSONDecodeError:
+            # This is binary audio data (streaming chunks)
+            if websocket in self.active_recordings:
+                recording = self.active_recordings[websocket]
+                recording['audio_data'].extend(message)
+                
+                # Send acknowledgment
+                response = {
+                    "type": "chunk_received",
+                    "size": len(message),
+                    "total_size": len(recording['audio_data'])
+                }
+                await websocket.send(json.dumps(response))
+                
+                # Show progress
+                duration = len(recording['audio_data']) / (
+                    recording['metadata']['sample_rate'] * 
+                    recording['metadata']['channels'] * 
+                    (recording['metadata']['bits_per_sample'] // 8)
+                )
+                print(f"Received chunk: {len(message)} bytes, Total: {duration:.1f}s", end='\r')
             else:
-                # Binary audio data from microphone
-                audio_buffer.extend(message)
-                if len(audio_buffer) % 10240 == 0:  # Debug every ~10KB
-                    print(f"[DEBUG] Recording progress: {len(audio_buffer)} bytes")
+                print("Received audio data without active recording session")
+    
+    def save_streaming_audio(self, recording):
+        """Save streaming audio data as WAV file"""
+        try:
+            metadata = recording['metadata']
+            sample_rate = metadata.get('sample_rate', 16000)
+            bits_per_sample = metadata.get('bits_per_sample', 16)
+            channels = metadata.get('channels', 1)
+            
+            with wave.open(recording['filepath'], 'wb') as wav_file:
+                wav_file.setnchannels(channels)
+                wav_file.setsampwidth(bits_per_sample // 8)
+                wav_file.setframerate(sample_rate)
+                wav_file.writeframes(bytes(recording['audio_data']))
+                
+            print(f"\nStreaming audio saved: {recording['filepath']}")
+            
+        except Exception as e:
+            print(f"Error saving streaming audio: {e}")
+    
+    async def send_audio_chunked(self, websocket, filename):
+        """Send audio file back in chunks to handle large files"""
+        filepath = os.path.join("audio_files", filename)
+        
+        if not os.path.exists(filepath):
+            await websocket.send(json.dumps({
+                "type": "error",
+                "message": "Audio file not found"
+            }))
+            return
+        
+        try:
+            # Send playback start notification
+            await websocket.send(json.dumps({"type": "playback_start"}))
+            
+            with open(filepath, 'rb') as f:
+                # Skip WAV header (44 bytes) to send raw audio data
+                f.seek(44)
+                
+                chunk_size = 4096  # 4KB chunks
+                while True:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    await websocket.send(chunk)
+                    await asyncio.sleep(0.01)  # Small delay to prevent overwhelming
+                    
+            print(f"Sent audio file back to client: {filename}")
+            
+        except Exception as e:
+            print(f"Error sending audio file: {e}")
+            await websocket.send(json.dumps({
+                "type": "error",
+                "message": f"Error sending audio: {e}"
+            }))
+                
+    async def websocket_handler(self, websocket, path):
+        """Handle WebSocket connections"""
+        await self.register_client(websocket)
+        try:
+            async for message in websocket:
+                await self.handle_message(websocket, message)
+        except websockets.exceptions.ConnectionClosed:
+            print("Client connection closed")
+        except Exception as e:
+            print(f"Error in websocket handler: {e}")
+        finally:
+            await self.unregister_client(websocket)
+    
+    def start_http_server(self):
+        """Start HTTP server for file downloads"""
+        class CustomHandler(SimpleHTTPRequestHandler):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, directory=os.getcwd(), **kwargs)
+                
+        httpd = HTTPServer(('localhost', self.http_port), CustomHandler)
+        print(f"HTTP server started on port {self.http_port}")
+        httpd.serve_forever()
+    
+    def get_server_ip(self):
+        """Get server IP address"""
+        import socket
+        try:
+            # Connect to Google DNS to get local IP
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(('8.8.8.8', 80))
+                return s.getsockname()[0]
+        except:
+            return 'localhost'
+    
+    async def start_websocket_server(self):
+        """Start WebSocket server"""
+        server_ip = self.get_server_ip()
+        print(f"WebSocket server starting on {server_ip}:{self.websocket_port}")
+        print(f"ESP32 should connect to: ws://{server_ip}:{self.websocket_port}")
+        
+        server = await websockets.serve(
+            self.websocket_handler, 
+            '0.0.0.0',  # Listen on all interfaces
+            self.websocket_port
+        )
+        
+        print("WebSocket server started successfully!")
+        print(f"Audio files will be saved in: {os.path.abspath('audio_files')}")
+        print("\nWaiting for ESP32 connections...")
+        
+        await server.wait_closed()
+    
+    def run(self):
+        """Run both HTTP and WebSocket servers"""
+        # Start HTTP server in a separate thread
+        http_thread = threading.Thread(target=self.start_http_server, daemon=True)
+        http_thread.start()
+        
+        # Run WebSocket server
+        try:
+            asyncio.run(self.start_websocket_server())
+        except KeyboardInterrupt:
+            print("\nShutting down servers...")
+        except Exception as e:
+            print(f"Server error: {e}")
 
-    except websockets.exceptions.ConnectionClosed:
-        print("[DEBUG] WebSocket connection closed")
-    except Exception as e:
-        print(f"[ERROR] WebSocket error: {e}")
-    finally:
-        # Cancel any running playback task
-        if hasattr(websocket, 'playback_task') and websocket.playback_task and not websocket.playback_task.done():
-            websocket.playback_task.cancel()
-        connected_clients.discard(websocket)
+def main():
+    print("=== ESP32 Audio WebSocket Server ===")
+    print("This server receives audio from ESP32, saves it, and sends it back")
+    print("Press Ctrl+C to stop\n")
+    
+    server = AudioServer(websocket_port=8765, http_port=8000)
+    server.run()
 
-async def websocket_server_main():
-    print("[DEBUG] Starting WebSocket server on port 8765...")
-    async with websockets.serve(handle_websocket, "0.0.0.0", 8765):
-        await asyncio.Future()
-
-def start_websocket_server():
-    asyncio.run(websocket_server_main())
-
-if __name__ == '__main__':
-    ws_thread = threading.Thread(target=start_websocket_server, daemon=True)
-    ws_thread.start()
-    print("[DEBUG] Starting Flask HTTP server on port 5000...")
-    app.run(host='0.0.0.0', port=5000, debug=False)
+if __name__ == "__main__":
+    main()
